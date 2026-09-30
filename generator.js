@@ -1,44 +1,10 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+/**
+ * MeteoAlarm & Ukraine Alerts Placefile Generator for GRLevelX
+ * - Fixed: Removed broken region-union logic. Renders each NUTS polygon natively.
+ * - Accuracy: 5 decimal places for lat/lon matching the working reference.
+ */
 
-// Приоритеты для сортировки (чтобы Extreme рисовался поверх остального)
-const SEVERITY_ORDER = {
-  Minor: 1,
-  Moderate: 2,
-  Severe: 3,
-  Extreme: 4
-};
-
-// Настройки стилей GR2A (RGBA, alpha 0-255)
-const CONFIG = {
-  title: "MeteoAlarm Europe Live Warnings",
-  refreshMinutes: 1,
-
-  severityStyles: {
-    Extreme: {
-      fill: "255 0 0 60",      // Ярко-красный
-      line: "255 0 0 255",     // Плотный контур
-      lineWidth: 2
-    },
-    Severe: {
-      fill: "255 120 0 45",    // Оранжевый
-      line: "255 120 0 200",
-      lineWidth: 1
-    },
-    Moderate: {
-      fill: "240 200 0 25",    // Мягкий жёлтый (фоновый)
-      line: "210 180 0 70",    // Едва заметная рамка
-      lineWidth: 1
-    },
-    Minor: {
-      fill: "0 150 255 15",    // Полупрозрачная голубая подсветка
-      line: "0 150 255 30",
-      lineWidth: 1
-    }
-  }
-};
-
-const FEEDS = [
+const METEOALARM_FEEDS = [
   "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-andorra",
   "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-austria",
   "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-belgium",
@@ -80,141 +46,297 @@ const FEEDS = [
   "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-united-kingdom"
 ];
 
-async function main() {
-  console.log("1. Fetching MeteoAlarm feeds...");
-  const rawWarnings = await fetchAllFeeds();
+// Lightweight GeoJSON Sources (Ukraine ADM1 + NUTS Level 2)
+const BOUNDARY_SOURCES = [
+  "https://raw.githubusercontent.com/wmgeolab/geoBoundaries/main/releaseData/gbOpen/UKR/ADM1/geoBoundaries-UKR-ADM1.geojson",
+  "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_20M_2021_4326_LEVL_2.geojson"
+];
 
-  console.log("2. Sorting & processing layers...");
-  // Сортировка: слабая угроза в начале файла -> критическая угроза в конце файла (чтобы ложилась НАД слабой)
-  const sortedWarnings = rawWarnings.sort((a, b) => {
-    const weightA = SEVERITY_ORDER[a.severity] || 0;
-    const weightB = SEVERITY_ORDER[b.severity] || 0;
-    return weightA - weightB;
-  });
+// RGBA Colors adapted from your working example
+const SEVERITY_COLORS = {
+  Extreme:  { fill: "255 0 0 25",     line: "255 0 0 70" },
+  Severe:   { fill: "255 140 0 25",   line: "255 140 0 70" },
+  Moderate: { fill: "240 200 0 25",   line: "210 180 0 70" },
+  Minor:    { fill: "0 180 230 25",   line: "0 120 200 70" }
+};
 
-  const lines = [
-    `Title: ${CONFIG.title}`,
-    `Refresh: ${CONFIG.refreshMinutes}`,
-    ""
-  ];
+const UKRAINE_REGION_ALIASES = {
+  "черкаська": "cherkasy", "cherkasy": "cherkasy",
+  "чернігівська": "chernihiv", "chernihiv": "chernihiv",
+  "чернівецька": "chernivtsi", "chernivtsi": "chernivtsi",
+  "дніпропетровська": "dnipropetrovsk", "dnipropetrovsk": "dnipropetrovsk",
+  "донецька": "donetsk", "donetsk": "donetsk",
+  "івано-франківська": "ivano-frankivsk", "ivanofrankivsk": "ivano-frankivsk",
+  "харківська": "kharkiv", "kharkiv": "kharkiv",
+  "херсонська": "kherson", "kherson": "kherson",
+  "хмельницька": "khmelnytskyi", "khmelnytskyi": "khmelnytskyi",
+  "кіровоградська": "kirovohrad", "kirovohrad": "kirovohrad", "kropyvnytskyi": "kirovohrad",
+  "київська": "kyiv", "kyiv": "kyiv", "kiev": "kyiv",
+  "луганська": "luhansk", "luhansk": "luhansk",
+  "львівська": "lviv", "lviv": "lviv",
+  "миколаївська": "mykolaiv", "mykolaiv": "mykolaiv",
+  "одеська": "odesa", "odesa": "odesa", "odessa": "odesa",
+  "полтавська": "poltava", "poltava": "poltava",
+  "рівненська": "rivne", "rivne": "rivne",
+  "сумська": "sumy", "sumy": "sumy",
+  "тернопільська": "ternopil", "ternopil": "ternopil",
+  "вінницька": "vinnytsia", "vinnytsia": "vinnytsia",
+  "волинська": "volyn", "volyn": "volyn",
+  "закарпатська": "zakarpattia", "zakarpattia": "zakarpattia",
+  "запорізька": "zaporizhzhia", "zaporizhzhia": "zaporizhzhia",
+  "житомирська": "zhytomyr", "zhytomyr": "zhytomyr",
+  "крим": "crimea", "crimea": "crimea",
+  "севастополь": "sevastopol", "sevastopol": "sevastopol"
+};
 
-  let totalPolygons = 0;
+export default {
+  async fetch(request, env, ctx) {
+    const cache = caches.default;
+    let response = await cache.match(request);
+    if (response) {
+      return response;
+    }
 
-  console.log("3. Formatting GR2A Placefile...");
-  for (const w of sortedWarnings) {
-    const style = CONFIG.severityStyles[w.severity] || CONFIG.severityStyles.Moderate;
-    const cleanTitle = w.title.replace(/"/g, "'").replace(/\s+/g, " ").trim();
+    try {
+      const warnings = await fetchAllMeteoAlarmWarnings();
 
-    for (const poly of w.polygons) {
-      if (!poly || poly.length < 3) continue;
-
-      // Заливка
-      lines.push(`Color: ${style.fill}`);
-      lines.push("Polygon:");
-      for (const [lat, lon] of poly) {
-        lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+      if (warnings.length === 0) {
+        const emptyResp = new Response("Title: MeteoAlarm Active Warnings\nRefresh: 1\n", {
+          headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=60" }
+        });
+        ctx.waitUntil(cache.put(request, emptyResp.clone()));
+        return emptyResp;
       }
-      lines.push("End:");
 
-      // Контур с текстом для Hover/Click в GR2A
-      lines.push(`Color: ${style.line}`);
-      lines.push(`Line: ${style.lineWidth}, 0, "${cleanTitle}"`);
-      for (const [lat, lon] of poly) {
-        lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
-      }
-      lines.push("End:");
-      lines.push("");
+      const activeNames = new Set(warnings.map(w => w.normalizedName));
+      const activeRegions = await fetchActiveRegionBoundaries(activeNames);
 
-      totalPolygons++;
+      const placefileContent = generatePlacefile(warnings, activeRegions);
+
+      response = new Response(placefileContent, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "public, max-age=60"
+        }
+      });
+
+      ctx.waitUntil(cache.put(request, response.clone()));
+      return response;
+    } catch (err) {
+      return new Response(`Error generating placefile: ${err.message}`, { status: 500 });
+    }
+  }
+};
+
+function normalizeName(str) {
+  if (!str) return "";
+  const cleanStr = str.toLowerCase().trim();
+
+  for (const [key, alias] of Object.entries(UKRAINE_REGION_ALIASES)) {
+    if (cleanStr.includes(key)) {
+      return alias;
     }
   }
 
-  console.log("4. Writing placefile.txt...");
-  const publicDir = path.join(process.cwd(), "public");
-  await fs.mkdir(publicDir, { recursive: true });
-  await fs.writeFile(path.join(publicDir, "placefile.txt"), lines.join("\n"), "utf-8");
-
-  console.log(`Done! Written ${totalPolygons} polygons into public/placefile.txt`);
+  return cleanStr
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
 }
 
-async function fetchAllFeeds() {
-  const promises = FEEDS.map(async (url) => {
+async function fetchAllMeteoAlarmWarnings() {
+  const fetchPromises = METEOALARM_FEEDS.map(async (url) => {
     try {
-      const res = await fetch(url, {
-        headers: { "User-Agent": "GR2A-Placefile-Gen/1.0" },
-        signal: AbortSignal.timeout(5000)
-      });
+      const res = await fetch(url, { headers: { "User-Agent": "GR2Analyst-Worker/1.0" } });
       if (!res.ok) return [];
-      const xml = await res.text();
-      return parseAtom(xml);
+      const xmlText = await res.text();
+      return parseFeedXml(xmlText);
     } catch {
       return [];
     }
   });
 
-  const results = await Promise.allSettled(promises);
-  return results
-    .filter((r) => r.status === "fulfilled" && Array.isArray(r.value))
-    .flatMap((r) => r.value);
-}
-
-function parseAtom(xml) {
+  const results = await Promise.allSettled(fetchPromises);
   const warnings = [];
-  let entryStart = xml.indexOf("<entry>");
 
-  while (entryStart !== -1) {
-    const entryEnd = xml.indexOf("</entry>", entryStart);
-    if (entryEnd === -1) break;
-
-    const entry = xml.substring(entryStart, entryEnd);
-    const title = extractTag(entry, "title") || "Weather Warning";
-    const severity = extractTag(entry, "cap:severity") || "Moderate";
-
-    const polygons = [];
-    let polyMatch;
-    const polyRegex = /<cap:polygon>([\s\S]*?)<\/cap:polygon>/g;
-
-    while ((polyMatch = polyRegex.exec(entry)) !== null) {
-      const points = polyMatch[1]
-        .trim()
-        .split(/\s+/)
-        .map((pt) => {
-          const parts = pt.split(",");
-          if (parts.length === 2) {
-            const lat = parseFloat(parts[0]);
-            const lon = parseFloat(parts[1]);
-            if (!isNaN(lat) && !isNaN(lon)) return [lat, lon];
-          }
-          return null;
-        })
-        .filter(Boolean);
-
-      if (points.length >= 3) {
-        polygons.push(points);
-      }
+  for (const res of results) {
+    if (res.status === "fulfilled" && Array.isArray(res.value)) {
+      warnings.push(...res.value);
     }
-
-    if (polygons.length > 0) {
-      warnings.push({ title, severity, polygons });
-    }
-
-    entryStart = xml.indexOf("<entry>", entryEnd);
   }
 
   return warnings;
 }
 
-function extractTag(text, tag) {
-  const openTag = `<${tag}>`;
-  const closeTag = `</${tag}>`;
-  const start = text.indexOf(openTag);
-  if (start === -1) return null;
-  const end = text.indexOf(closeTag, start + openTag.length);
-  if (end === -1) return null;
-  return text.substring(start + openTag.length, end).trim();
+function parseFeedXml(xmlText) {
+  const warnings = [];
+  const entries = xmlText.split("<entry>");
+
+  for (let i = 1; i < entries.length; i++) {
+    const entry = entries[i];
+
+    const titleMatch = entry.match(/<title>(.*?)<\/title>/s);
+    const severityMatch = entry.match(/<cap:severity>(.*?)<\/cap:severity>/s);
+    const areaDescMatch = entry.match(/<cap:areaDesc>(.*?)<\/cap:areaDesc>/s);
+    const polygonMatch = entry.match(/<cap:polygon>(.*?)<\/cap:polygon>/s);
+
+    const title = titleMatch ? titleMatch[1].trim() : "Weather Warning";
+    const severity = severityMatch ? severityMatch[1].trim() : "Moderate";
+    const areaDesc = areaDescMatch ? areaDescMatch[1].trim() : "";
+
+    let capPolygon = null;
+    if (polygonMatch) {
+      const rawCoords = polygonMatch[1].trim().split(/\s+/);
+      capPolygon = rawCoords.map(pt => {
+        const [lat, lon] = pt.split(",").map(Number);
+        return [lon, lat];
+      });
+    }
+
+    if (areaDesc) {
+      const regionList = areaDesc.split(/[,;\n]+/).map(r => r.trim()).filter(Boolean);
+      for (const regionName of regionList) {
+        const norm = normalizeName(regionName);
+        if (norm.length >= 3) {
+          warnings.push({
+            regionName,
+            normalizedName: norm,
+            severity,
+            title,
+            capPolygon
+          });
+        }
+      }
+    }
+  }
+
+  return warnings;
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+async function fetchActiveRegionBoundaries(activeNames) {
+  const activeRegions = [];
+
+  for (const url of BOUNDARY_SOURCES) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const geojson = await res.json();
+
+      if (!geojson.features) continue;
+
+      for (const feature of geojson.features) {
+        const props = feature.properties || {};
+        const name = props.shapeName || props.NUTS_NAME || props.NAME_LATN || props.NAME || props.id;
+        if (!name) continue;
+
+        const norm = normalizeName(name);
+        if (norm.length < 3) continue;
+
+        let isMatch = false;
+        for (const activeName of activeNames) {
+          if (activeName === norm || (norm.length >= 4 && (activeName.includes(norm) || norm.includes(activeName)))) {
+            isMatch = true;
+            break;
+          }
+        }
+
+        if (!isMatch) continue;
+
+        const geometry = feature.geometry;
+        if (!geometry) continue;
+
+        const polygons = [];
+        if (geometry.type === "Polygon") {
+          polygons.push(geometry.coordinates[0]);
+        } else if (geometry.type === "MultiPolygon") {
+          for (const poly of geometry.coordinates) {
+            polygons.push(poly[0]);
+          }
+        }
+
+        if (polygons.length > 0) {
+          activeRegions.push({ name, normalizedName: norm, polygons });
+        }
+      }
+    } catch (e) {
+      console.error(`Boundary fetch error: ${url}`, e);
+    }
+  }
+
+  return activeRegions;
+}
+
+function findWarning(regionNorm, warnings) {
+  if (!regionNorm || regionNorm.length < 3) return null;
+
+  return warnings.find(w => {
+    if (!w.normalizedName || w.normalizedName.length < 3) return false;
+    if (w.normalizedName === regionNorm) return true;
+    if (regionNorm.length >= 4 && w.normalizedName.length >= 4) {
+      return w.normalizedName.includes(regionNorm) || regionNorm.includes(w.normalizedName);
+    }
+    return false;
+  });
+}
+
+function generatePlacefile(warnings, regions) {
+  const lines = [
+    "Title: MeteoAlarm Europe & Ukraine Warnings",
+    "Refresh: 1",
+    ""
+  ];
+
+  const processedWarnings = new Set();
+
+  // Рендерим полигоны NUTS напрямую (без склейки, как в рабочем примере)
+  for (const region of regions) {
+    const warning = findWarning(region.normalizedName, warnings);
+    if (!warning) continue;
+
+    processedWarnings.add(warning);
+    const colorSpec = SEVERITY_COLORS[warning.severity] || SEVERITY_COLORS.Moderate;
+    const hoverText = `${warning.title} issued for ${region.name}`;
+
+    for (const poly of region.polygons) {
+      // Заливка полигона
+      lines.push(`Color: ${colorSpec.fill}`);
+      lines.push("Polygon:");
+      for (const [lon, lat] of poly) {
+        lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+      }
+      lines.push("End:");
+
+      // Контур полигона
+      lines.push(`Color: ${colorSpec.line}`);
+      lines.push(`Line: 1, 0, "${hoverText}"`);
+      for (const [lon, lat] of poly) {
+        lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+      }
+      lines.push("End:");
+    }
+  }
+
+  // Фолбэк: рендерим родные CAP полигоны для регионов, которые не нашлись в NUTS
+  for (const warning of warnings) {
+    if (processedWarnings.has(warning) || !warning.capPolygon) continue;
+
+    const colorSpec = SEVERITY_COLORS[warning.severity] || SEVERITY_COLORS.Moderate;
+
+    lines.push(`Color: ${colorSpec.fill}`);
+    lines.push("Polygon:");
+    for (const [lon, lat] of warning.capPolygon) {
+      lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+    }
+    lines.push("End:");
+
+    lines.push(`Color: ${colorSpec.line}`);
+    lines.push(`Line: 1, 0, "${warning.title} issued for ${warning.regionName}"`);
+    for (const [lon, lat] of warning.capPolygon) {
+      lines.push(`  ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+    }
+    lines.push("End:");
+  }
+
+  return lines.join("\n");
+}
